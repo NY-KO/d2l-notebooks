@@ -1,4 +1,5 @@
 # d2l-notebooks
 
-本仓库收录了我学习《动手学深度学习》书中各章的 Jupyter Notebook以及我学习的画像识别AI
+This repository contains the Jupyter Notebooks for each chapter of “Dive into Deep Learning” that I studied, as well as the image-recognition AI projects I worked on.
+
 
