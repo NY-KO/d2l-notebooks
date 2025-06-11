@@ -1,0 +1,361 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision
+from torchvision import datasets
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from torchsummary import summary
+
+from sklearn.metrics import accuracy_score,classification_report
+from tqdm import tqdm
+import time
+import warnings
+warnings.simplefilter("ignore")
+
+training_path = "C:/Users/vislect-hmd04/.cache/kagglehub/datasets/sartajbhuvaji/brain-tumor-classification-mri/versions/2/Training/"
+testing_path = "C:/Users/vislect-hmd04/.cache/kagglehub/datasets/sartajbhuvaji/brain-tumor-classification-mri/versions/2/Testing/"
+
+#HyperParamaters
+IMAGE_SIZE =(128, 128) #所有图片会被统一调整为 128x128 像素的大小
+batch_size = 64 #一次性送入神经网络训练的图像数量
+learning_rate = 0.0008 #学习率决定模型参数每次更新的“步长”
+epochs = 50 #训练数据将被反复使用 50 次
+num_classes = 4 #该数据集一共分为 4 类
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+#Loading data
+def images_transforms(phase): #预处理
+    if phase == "training":
+        data_transformation = transforms.Compose([ #将多个图像处理步骤按顺序组合起来执行
+            transforms.Resize(IMAGE_SIZE), #将图像尺寸统一调整为 IMAGE_SIZE
+            transforms.RandomRotation(degrees = (-25, 20)), #随机旋转图像，角度范围在 -25 到 +20 度之间
+            #这样做可以增加模型对不同方向图像的鲁棒性,是数据增强的一种手段
+            transforms.ToTensor(), #将 PIL 图像 转换为 PyTorch 的 Tensor
+            #会把原始的 8-bit 图像（像素值在 0–255）转换成浮点 Tensor，并自动除以 255，映射到 [0.0, 1.0]
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            #改变均值（mean）：相当于把像素值先整体向左（减小）或向右（增大）移动。
+            # 改变标准差（std）：相当于把像素值的“振幅”压缩（std 大）或放大（std 小）
+            #对图像进行标准化处理（均值 & 标准差）
+            #x_norm = (x_orig - mean) / std
+        ])
+    else: #与训练阶段基本相同，但不包含数据增强（如旋转）
+        data_transformation = transforms.Compose([
+            transforms.Resize(IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+    return data_transformation
+
+#使用 ImageFolder 从指定的文件夹中加载训练图像数据,ImageFolder来自from torchvision import datasets
+#用定义好的图像预处理函数images_transforms，做增强（如旋转、归一化等）
+#构建数据集时，PyTorch 会自动把每个子文件夹的名字（比如 glioma、meningioma、pituitary）映射到一个整数(比如0,1,2)上，保存在 class_to_idx
+#trainset.class_to_idx == {
+   #'glioma': 0,
+   #'meningioma':  1,
+   #'pituitary':   2
+#}
+trainset = datasets.ImageFolder(training_path, transform = images_transforms('training'))
+#这行代码里的 'test' 其实只是一个传给函数 images_transforms(phase) 的字符串参数,只要 不是 'training'，就会走 else 分支
+testset = datasets.ImageFolder(testing_path, transform = images_transforms('test'))
+#只差一层的用.就行，相隔太远要import from
+#把传入的 dataset 随机划分成若干个子集，这里拆成两个子集，分别包含 150 张和 244 张样本
+#trainset：训练用 valset：模型训练时用于调参和早停的验证集 testset：训练完成后评估模型性能的测试集
+testset, valset = torch.utils.data.random_split(testset, [150, 244])
+
+#包装成可以按批次（batch）迭代的数据加载器（loader）
+#batch_size：每个 batch 中包含多少张图片
+#shuffle=True：是否在每个 epoch 开始前打乱数据顺序
+#num_workers=2：用多少个子进程来并行加载数据，子进程越多，CPU 并行预处理速度越快
+train_loader = DataLoader(trainset,batch_size=batch_size,shuffle=True,num_workers=0)
+test_loader = DataLoader(testset,batch_size=batch_size,shuffle=True,num_workers=0)
+val_loader = DataLoader(valset,batch_size=batch_size,shuffle=True,num_workers=0)
+
+#Visualize the data
+#def imshow(img):
+    #plt.figure(figsize=(20, 20)) #创建一个新的 Matplotlib 图形，并指定画布大小为 20×20 英寸
+    #隔离画布：保证每次调用 imshow 时都是在一个“干净”的新画布上绘图，不会与之前的图像叠加或干扰
+    #自定义大小：figsize=(20,20) 表示画布宽、高各 20 英寸，方便放大查看细节
+    #img = img / 2 + 0.5  #之前是标准化x_norm = (x_orig - mean) / std
+    #现在把除的乘回去x_orig = x_norm * std + mean
+    #训练时用标准化，让模型学得更好；显示时去掉标准化，让人看得舒服
+    #npimg = img.numpy() #把 PyTorch 的 Tensor 转换成 NumPy 数组
+    #Matplotlib 的 imshow 函数只能接收 NumPy 数组或类似格式的数据，不能直接渲染 PyTorch Tensor
+    #plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    #(1, 2, 0)就把第 0 维（通道）移动到最后，第 1 维和第 2 维前移，(C, H, W) 调整到 (H, W, C)
+    #因为PyTorch Tensor 的默认通道顺序是 (通道, 高度, 宽度)，而 Matplotlib 要求的图像数组格式是 (高度, 宽度, 通道)
+    #正确对应 Matplotlib 的输入格式，才能以 RGB 形式显示彩色图
+    #plt.show()
+
+def imshow(img, mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]):
+    # 输入的 img 形状是 [3, H, W]，数值已经是 Normalize 过的
+    img = img.clone()  # 避免改动原 Tensor
+    for c in range(3):
+        img[c] = img[c] * std[c] + mean[c]  # 反标准化：x_orig = x_norm * std + mean
+        # 之前是标准化x_norm = (x_orig - mean) / std
+        # 现在把除的乘回去x_orig = x_norm * std + mean
+        # 训练时用标准化，让模型学得更好；显示时去掉标准化，让人看得舒服 *原本模版只是为了展示所以偷懒直接用0.5反标准化，也导致show的图颜色失调是蓝色
+    plt.figure(figsize=(20, 20))  # 创建一个新的 Matplotlib 图形，并指定画布大小为 20×20 英寸
+    # 隔离画布：保证每次调用 imshow 时都是在一个“干净”的新画布上绘图，不会与之前的图像叠加或干扰
+    # 自定义大小：figsize=(20,20) 表示画布宽、高各 20 英寸，方便放大查看细节
+    npimg = img.numpy()  # 把 PyTorch 的 Tensor 转换成 NumPy 数组
+    # Matplotlib 的 imshow 函数只能接收 NumPy 数组或类似格式的数据，不能直接渲染 PyTorch Tensor
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    # (1, 2, 0)就把第 0 维（通道）移动到最后，第 1 维和第 2 维前移，(C, H, W) 调整到 (H, W, C)
+    # 因为PyTorch Tensor 的默认通道顺序是 (通道, 高度, 宽度)，而 Matplotlib 要求的图像数组格式是 (高度, 宽度, 通道)
+    # 正确对应 Matplotlib 的输入格式，才能以 RGB 形式显示彩色图
+    plt.show()
+
+
+#train_loader 是一个 DataLoader，它本身是一个可迭代对象
+#iter(train_loader) 把它转换成一个迭代器，下一步可以用 .next() 一次拿到一个 batch 的数据
+examples = iter(train_loader)
+#images 的形状是 [batch_size, C, H, W]：batch_size 表示这个 batch 里一共有多少张图片，
+#labels 的形状是 [batch_size]：batch_size，表示有多少个标签，每个标签对应 images 里同位置的那张图
+images,labels = next(examples)
+#这样就拿到了一组样本，可以在不跑整个训练循环的情况下，快速检查数据长什么样、标签是否对得上图
+#torchvision.utils.make_grid(images)把 images 里的多张小图拼接到一张大图里
+#调用imshow，会自动“反标准化”并把拼好的大图显示出来
+imshow(torchvision.utils.make_grid(images))
+
+#Model Creation and Initialization
+model=torchvision.models.mobilenet_v3_large(pretrained=True) #这是一个别人训练好的模型
+print(model) #我为了学习自己看一下模型
+num_features=model.classifier[0].in_features #找到别人训练好的模型最后一次的特征量，这样就不用print(model)看具体值
+#想看具体值的话print(model)后拉到最后(classifier)，是960
+
+#nn.Sequential 是一个容器，它把你传进去的各个层按前后顺序连接起来，形成一个新的子网络
+model.classifier=nn.Sequential(
+    nn.Linear(in_features=num_features, out_features=4096, bias=True), #从别人训练好的模型最后一次的特征量num_features开始
+    nn.ReLU(inplace=True), #对上一层的输出做 ReLU（线性整流）非线性激活
+    #引入非线性，使网络能够拟合更复杂的函数；inplace=True 表示直接在原地修改内存，节省一点显存
+    nn.Dropout(p=0.5, inplace=False), #在训练时随机将一半（p=0.5）的激活单元置为 0，防止过拟合
+    #Dropout 是一种常用的正则化技术，用来降低模型的过拟合风险
+    #它的核心思想是在训练过程中，随机“丢弃”（即置零）一部分神经元的输出，使网络无法过度依赖某些特定的路径，从而提升泛化能力
+    nn.Linear(in_features=4096, out_features=4096, bias=True), #再做一次高维特征转换，让网络能够进一步抽象出更深层次的特征
+    nn.ReLU(inplace=True),
+    nn.Dropout(p=0.5, inplace=False),
+    nn.Linear(in_features=4096, out_features=num_classes, bias=True) #num_classes=4，是肿瘤的4个集
+  )
+
+#我自己确认bias和shape
+linear0 = model.classifier[0]             # 第一层 Linear
+print(linear0.bias)                       # 初始化bias不是0，是我模型mobilenet_v3_large的bias
+print(linear0.bias.shape)                 # torch.Size([4096])
+
+#「将模型部署到合适设备」、「定义损失函数」、「定义优化器」这三个训练前必须的准备步骤
+#把模型搬到指定的device上，我这里是上面定义的cpu
+#因为PyTorch 张量在计算时要求：参与运算的所有张量（包括模型参数、输入数据）必须在同一个 device 上
+model=model.to(device)
+#网络的 最后一层输出 会有4个数值（4 个 logits），
+#再用这些 logits 通过 Softmax 得到对应的概率分布（也是 num_classes 个值），
+#Softmax（归一化指数函数）是一种常用于多分类模型最后一层的激活函数，它的作用是把网络输出的一组“原始分数”（logits）映射为一个“概率分布”，
+#使得所有输出值都在 0 到 1 之间，且加起来等于 1，Softmax 会这样计算每个类别 i 的概率
+#然后把这 num_classes 个概率拿来和真实标签做交叉熵计算，得到一个标量损失，指导模型参数更新。
+#目的：创建一个交叉熵损失函数，通常用于多分类任务，后面训练模型时调用
+criterion=nn.CrossEntropyLoss()
+#创建一个 Adamax 优化器，用来在每次反向传播之后更新模型参数
+#Adamax是 Adam 优化算法的一种变种，基于无穷范数实现。它的优点是对学习率（lr）比较不敏感、数值更稳定
+#学习率，即每一步更新时“向梯度反方向迈出的步长”
+optimizer = torch.optim.Adamax(model.parameters(),lr=learning_rate)
+
+#Model Visualization
+#修改 IMAGE_SIZE 以包含 “通道数” 这一维度
+#IMAGE_SIZE = (H, W)变成了 (3, H, W)，3对应的是彩色图片的通道数（RGB）
+#因为 PyTorch 中大多数预训练网络都要求输入形状是 (C, H, W)
+IMAGE_SIZE=(3,)+IMAGE_SIZE
+summary(model,IMAGE_SIZE)
+
+#Model Training
+#“什么时候需要计算梯度？”
+#训练阶段需要，因为只有得到梯度，才能更新（优化）模型参数
+#验证/测试/推理 阶段 不需要，此时只关心模型输出准确率或性能，不会更新参数
+#反向传播是计算梯度的过程
+#这里是测试test，预先封装这个函数后面调用测试模型训练的好不好
+def test(model, testloader): #testloader：测试集的 DataLoader，负责按批次（batch）不断地从测试集里取出 (images, labels) 对
+    with torch.no_grad(): #这里是在验证准确率，不用知道梯度，用no_grad来关闭梯度计算
+        n_correct = 0  #记录模型在测试集上预测正确的样本个数
+        n_samples = 0  #记录测试集中样本的总数（按批次累积）
+        y_pred = []  #一个空列表，待会用来“累积”每个批次的预测标签（预测类别）
+        y_actual = []  #一个空列表，用来“累积”每个批次的真实标签
+        for i, (images, labels) in enumerate(testloader): #完整遍历所有 batch，之前为了确认可视化的时候只是一个batch
+            images = images.to(device)
+            labels = labels.to(device)
+            #得到所有类别的分数，outputs 通常是形状 [batch_size, num_classes] 的张量
+            outputs = model(images)  #将一批图像 images 作为模型输入，得到模型的输出张量 outputs
+            #累积真实标签
+            #labels 本身来自 for images, labels in testloader，它就是这一批次的「真实类别索引」
+            #labels.detach() 会返回一个新的张量，这个张量与原来 labels 拥有相同的数据内容，但无论如何对它做后续操作，PyTorch 都不会再把这些操作记录到梯度计算里
+            #to('cpu')把张量搬回 CPU，因为后面要转换成 NumPy 数组，numpy无法读取显存
+            #np.array将形如 [batch_size] 的 Tensor 转成 NumPy 数组，并展平成一维
+            #把当前批次所有样本的真实标签（一个“列表”）拼接到 y_actual 这个列表末尾
+            y_actual += list(np.array(labels.detach().to('cpu')).flatten())
+            #torch.max(outputs, 1)：对 outputs 在维度 1（即类别维度）上求最大值，返回两个张量：
+            # 第一个返回值 _：最大值本身（不需要）
+            # 第二个返回值 predictes：对应最大值的索引（即模型预测的类别索引）
+            # value ,index
+            _, predictes = torch.max(outputs, 1)
+            #累积“预测标签”
+            y_pred += list(np.array(predictes.detach().to('cpu')).flatten())
+            # number of samples in current batch
+            n_samples += labels.shape[0]
+            #.sum()：对布尔张量predictes == labels求和（True 当作 1 来计算），得到当前 batch 中预测正确的样本个数
+            #将当前批次预测正确的个数累加到 n_correct，最后得到测试集中一共预测对了多少张图
+            n_correct += (predictes == labels).sum().item() #.item()：将标量张量转成 Python 数值
+        #方便地传给 sklearn.metrics.classification_report 等函数，进行矢量化计算
+        y_actual = np.array(y_actual).flatten()
+        y_pred = np.array(y_pred).flatten()
+        #np.unique(y_pred)：返回 y_pred 数组中出现过的、从小到大排序的不重复值列表（即该次推理里模型实际预测到了哪些类别）
+        # 目的是快速检查一下，测试时模型是不是有漏掉某些类别的预测，或者是否存在某些类别完全没被预测到的情况
+        print(np.unique(y_pred))
+        # 如果 trainset.classes = ['cat', 'dog', 'bird']，那么分类报告里的行就会以 cat、dog、bird 命名，而不是以索引 0、1、2 来显示
+        acc = classification_report(y_actual, y_pred, target_names=trainset.classes)
+        print(f"{acc}") #这里只是封一个函数，还没有调用自然没有输出
+
+#model：待训练的 PyTorch 模型（继承自 torch.nn.Module 的实例）
+#criterion：损失函数（如 nn.CrossEntropyLoss()、nn.BCELoss() 等）
+# 优化器（如 torch.optim.Adam、SGD 等），用于更新模型参数
+# 验证集的 DataLoader，用于评估模型在验证集上的表现
+def train(model, train_loader, criterion, optimizer, val_loader, epochs=25): #epochs是训练轮数，之前batchsize分了4个集，所以测试100次，训练轮数多就次数高
+    train_losses = []      # 存储每轮训练集的平均损失
+    val_losses = []       # 存储每轮验证集的平均损失
+    train_auc = []          # 存储每轮训练集的准确率
+    val_auc = []   # 存储每轮验证集的准确率
+    train_auc_epoch = []   #和train_auc = []一样，用来区分不同阶段的
+    val_auc_epoch = []
+    best_acc = 0.0   # 记录迄今为止验证集准确率（AUC）的最高值
+    min_loss = np.inf # 记录迄今为止验证集损失的最小值，用于保存“最佳模型”
+
+    since = time.time()
+    y_actual = []
+    y_pred = []
+    #每个 epoch 开始时，清空上一轮积累的 y_actual、y_pred，并重置单轮损失值
+    for e in range(epochs):
+        y_actual = []
+        y_pred = []
+        train_loss = 0.0
+        val_loss = 0.0
+
+        # Train the model
+        model.train() # 将 model 设置为“训练模式”，启用 Dropout、BatchNorm 等
+        #tqdm(...) 用于显示进度条，方便查看训练进度；total=int(len(train_loader)) 明确指定总共多少个 batch
+        for i, (images, labels) in enumerate(tqdm(train_loader, total=int(len(train_loader)))):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            # Backward and optimize
+            optimizer.zero_grad() #每次更新前都要先 zero_grad()，否则 PyTorch 会把梯度累加到上一轮的梯度上
+            loss.backward() #会根据当前计算图反向传播，把梯度存储到各个可训练参数的 .grad 中
+            optimizer.step() #根据存储的梯度来更新所有参数（如权重和偏置）
+
+            # Loss and accuracy
+            train_loss += loss.item()
+
+            _, predictes = torch.max(outputs, 1)
+            y_actual += list(labels.data.cpu().numpy().flatten())
+            y_pred += list(predictes.detach().cpu().numpy().flatten())
+        train_auc.append(accuracy_score(y_actual, y_pred))
+
+        # Evaluate the model
+        model.eval()  # 将模型切换到“评估模式”，关闭 Dropout、使用固定的 BatchNorm 均值/方差
+        for i, (images, labels) in enumerate(tqdm(val_loader, total=int(len(val_loader)))):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            # Loss and accuracy
+            val_loss += loss.item()
+            _, predictes = torch.max(outputs, 1)
+            y_actual += list(labels.data.cpu().numpy().flatten())
+            y_pred += list(predictes.detach().cpu().numpy().flatten())
+
+        val_auc.append(accuracy_score(y_actual, y_pred))
+
+        # Average losses and accuracies
+        train_loss = train_loss / len(train_loader)
+        val_loss = val_loss / len(val_loader)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        training_auc = train_auc[-1] #取出 train_auc[-1]（刚刚在训练阶段计算得到的准确率）作为 training_auc
+        validation_auc = val_auc[-1]
+        train_auc_epoch.append(training_auc)
+        val_auc_epoch.append(validation_auc)
+
+        # Updating best validation accuracy
+        if best_acc < validation_auc:
+            best_acc = validation_auc
+
+        # Saving best model 这里保存了最佳模型运行后的数据到本地
+        if min_loss >= val_loss:
+            torch.save(model.state_dict(), 'best_model.pt')
+            min_loss = val_loss
+
+        #print(...)：提供「实时监控」功能，帮助你在训练过程中及时掌握模型表现。
+        #return …：提供「后续处理」能力，让你能拿到完整的数值列表用于可视化和分析。
+        print(
+            'EPOCH {}/{} Train loss: {:.6f},Validation loss: {:.6f}, Train AUC: {:.4f}  Validation AUC: {:.4f}\n  '.format(
+                e + 1, epochs, train_loss, val_loss, training_auc, validation_auc))
+        print('-' * 10)
+    time_elapsed = time.time() - since
+    print('Training completed in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best validation accuracy: {:4f}'.format(best_acc))
+    return train_losses, val_losses, train_auc, val_auc, train_auc_epoch, val_auc_epoch
+
+#train_losses,val_losses,train_auc ,val_auc,train_auc_epoch,val_auc_epoch=train(model,train_loader,criterion,optimizer,val_loader,epochs)
+
+model.load_state_dict(torch.load('best_model.pt'))
+model.eval()  # 切到评估模式
+
+test(model,test_loader)
+
+
+#预测一张图
+from PIL import Image
+
+# 2. 类别名称（按你训练时的顺序填入）
+class_names = ['glioma_tumor', 'meningioma', 'no_tumor', 'pituitary_tumor']
+
+# 3. 加载模型并切换到 eval 模式
+# model = model
+# checkpoint = torch.load('best_model.pt', map_location=device)
+# model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
+# model.to(device)
+# model.eval()
+
+# 4. 定义与训练时相同的预处理
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),      # 或者你训练时用的输入尺寸
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# 5. 读取并预处理单张图像
+#img_path = "C:/Users/vislect-hmd04/.cache/kagglehub/datasets/sartajbhuvaji/brain-tumor-classification-mri/versions/2/Testing/glioma_tumor/image(1).jpg"
+img_path = "C:/Users/vislect-hmd04/.cache/kagglehub/datasets/sartajbhuvaji/brain-tumor-classification-mri/versions/2/Testing/no_tumor/image(1).jpg"
+img = Image.open(img_path).convert('RGB')
+input_tensor = preprocess(img).unsqueeze(0).to(device)  # 变成 1×C×H×W
+
+# 6. 推断并取最大概率的类别
+with torch.no_grad():
+    outputs = model(input_tensor)               # shape [1,4]
+    probs = torch.softmax(outputs, dim=1)       # shape [1,4]
+
+# 打印概率时同样要先 squeeze 或索引：
+for idx, name in enumerate(class_names):
+    print(f"{name:15s}: {probs[0, idx].item():.4f}")
+
+# 取最大值下标
+pred_idx = torch.argmax(probs, dim=1)[0].item()
+print(f"\nPredicted class: {class_names[pred_idx]} (index={pred_idx})")
